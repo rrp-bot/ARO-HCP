@@ -620,7 +620,7 @@ func getBaseCSClusterBuilder(updating bool) *arohcpv1alpha1.ClusterBuilder {
 		Properties(map[string]string{}).
 		API(clusterAPIBuilder.CIDRBlockAccess(arohcpv1alpha1.NewCIDRBlockAccess().
 			Allow(arohcpv1alpha1.NewCIDRBlockAllowAccess().
-				Mode(csCIDRBlockAllowAccessModeAllowAll)))).
+				Mode(CSCIDRBlockAllowAccessModeAllowAll)))).
 		RegistryConfig(arohcpv1alpha1.NewClusterRegistryConfig().ImageDigestMirrors())
 }
 
@@ -668,7 +668,7 @@ func TestBuildCSCluster(t *testing.T) {
 					Listening(arohcpv1alpha1.ListeningMethodInternal).
 					CIDRBlockAccess(arohcpv1alpha1.NewCIDRBlockAccess().
 						Allow(arohcpv1alpha1.NewCIDRBlockAllowAccess().
-							Mode(csCIDRBlockAllowAccessModeAllowList).
+							Mode(CSCIDRBlockAllowAccessModeAllowList).
 							Values("10.0.0.0/8", "192.168.0.0/16")))),
 		},
 		{
@@ -725,7 +725,7 @@ func TestBuildCSCluster(t *testing.T) {
 				API(arohcpv1alpha1.NewClusterAPI().
 					CIDRBlockAccess(arohcpv1alpha1.NewCIDRBlockAccess().
 						Allow(arohcpv1alpha1.NewCIDRBlockAllowAccess().
-							Mode(csCIDRBlockAllowAccessModeAllowList).
+							Mode(CSCIDRBlockAllowAccessModeAllowList).
 							Values("172.16.0.0/12", "203.0.113.0/24")))),
 		},
 		{
@@ -997,7 +997,7 @@ func TestBuildCSCluster(t *testing.T) {
 					Listening(arohcpv1alpha1.ListeningMethodExternal).
 					CIDRBlockAccess(arohcpv1alpha1.NewCIDRBlockAccess().
 						Allow(arohcpv1alpha1.NewCIDRBlockAllowAccess().
-							Mode(csCIDRBlockAllowAccessModeAllowAll)))).
+							Mode(CSCIDRBlockAllowAccessModeAllowAll)))).
 				Azure(arohcpv1alpha1.NewAzure().
 					EtcdEncryption(arohcpv1alpha1.NewAzureEtcdEncryption().
 						DataEncryption(arohcpv1alpha1.NewAzureEtcdDataEncryption().
@@ -1064,7 +1064,7 @@ func TestBuildCSCluster(t *testing.T) {
 					Listening(arohcpv1alpha1.ListeningMethodExternal).
 					CIDRBlockAccess(arohcpv1alpha1.NewCIDRBlockAccess().
 						Allow(arohcpv1alpha1.NewCIDRBlockAllowAccess().
-							Mode(csCIDRBlockAllowAccessModeAllowAll)))).
+							Mode(CSCIDRBlockAllowAccessModeAllowAll)))).
 				Azure(arohcpv1alpha1.NewAzure().
 					EtcdEncryption(arohcpv1alpha1.NewAzureEtcdEncryption().
 						DataEncryption(arohcpv1alpha1.NewAzureEtcdDataEncryption().
