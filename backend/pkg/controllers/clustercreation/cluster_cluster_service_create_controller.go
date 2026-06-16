@@ -105,8 +105,11 @@ func (c *clusterClusterServiceCreateSyncer) SyncOnce(ctx context.Context, key co
 		return utils.TrackError(fmt.Errorf("failed to get or create ServiceProviderCluster: %w", err))
 	}
 
-	if existingServiceProviderCluster.Spec.ControlPlaneVersion.DesiredVersion == nil {
-		logger.Info("DesiredVersion not yet set, waiting for desiredversion controller")
+	ready, err := c.createPreconditionDesiredVersionResolved(ctx, existingServiceProviderCluster)
+	if err != nil {
+		return utils.TrackError(err)
+	}
+	if !ready {
 		return nil
 	}
 
@@ -148,6 +151,17 @@ func (c *clusterClusterServiceCreateSyncer) SyncOnce(ctx context.Context, key co
 	}
 
 	return nil
+}
+
+// createPreconditionDesiredVersionResolved reports whether the ControlPlaneDesiredVersion
+// controller has written the Cincinnati-resolved desired version to the ServiceProviderCluster.
+// Returns (false, nil) when this controller should wait and retry.
+func (c *clusterClusterServiceCreateSyncer) createPreconditionDesiredVersionResolved(ctx context.Context, serviceProviderCluster *api.ServiceProviderCluster) (bool, error) {
+	if serviceProviderCluster.Spec.ControlPlaneVersion.DesiredVersion != nil {
+		return true, nil
+	}
+	utils.LoggerFromContext(ctx).Info("DesiredVersion not yet set, waiting for ControlPlaneDesiredVersion controller")
+	return false, nil
 }
 
 // findAROHCPClusterByAzureInfo returns the Cluster Service cluster whose Azure
