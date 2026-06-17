@@ -472,6 +472,7 @@ func (b *Backend) runBackendControllersUnderLeaderElection(ctx context.Context, 
 		b.options.ClustersServiceClient,
 		http.DefaultClient,
 		activeOperationInformer,
+		backendInformers,
 	)
 	operationNodePoolUpdateController := operationcontrollers.NewOperationNodePoolUpdateController(
 		b.clock,

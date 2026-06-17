@@ -22,6 +22,9 @@ import (
 	"strings"
 	"time"
 
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
 	arohcpv1alpha1 "github.com/openshift-online/ocm-sdk-go/arohcp/v1alpha1"
 	ocmerrors "github.com/openshift-online/ocm-sdk-go/errors"
 
@@ -35,11 +38,14 @@ import (
 	"github.com/Azure/ARO-HCP/internal/utils"
 )
 
+const NodePoolClusterServiceCreateControllerName = "NodePoolClusterServiceCreate"
+
 type nodePoolClusterServiceCreateSyncer struct {
 	cooldownChecker       controllerutil.CooldownChecker
 	resourcesDBClient     database.ResourcesDBClient
 	nodePoolLister        listers.NodePoolLister
 	clusterLister         listers.ClusterLister
+	controllerLister      listers.ControllerLister
 	clustersServiceClient ocm.ClusterServiceClientSpec
 }
 
@@ -51,16 +57,18 @@ func NewNodePoolClusterServiceCreateController(
 ) controllerutils.Controller {
 	_, nodePoolLister := informers.NodePools()
 	_, clusterLister := informers.Clusters()
+	_, controllerLister := informers.Controllers()
 	syncer := &nodePoolClusterServiceCreateSyncer{
 		cooldownChecker:       controllerutils.DefaultActiveOperationPrioritizingCooldown(activeOperationLister),
 		resourcesDBClient:     resourcesDBClient,
 		nodePoolLister:        nodePoolLister,
 		clusterLister:         clusterLister,
+		controllerLister:      controllerLister,
 		clustersServiceClient: clustersServiceClient,
 	}
 
 	return controllerutils.NewNodePoolWatchingController(
-		"NodePoolClusterServiceCreate",
+		NodePoolClusterServiceCreateControllerName,
 		resourcesDBClient,
 		informers,
 		time.Minute,
@@ -101,6 +109,15 @@ func (c *nodePoolClusterServiceCreateSyncer) SyncOnce(ctx context.Context, key c
 		return nil
 	}
 
+	intentFailed, err := c.isIntentFailed(ctx, key)
+	if err != nil {
+		return utils.TrackError(err)
+	}
+	if intentFailed {
+		// If we failed permanently, we don't need to try again.
+		return nil
+	}
+
 	// For the Cluster, we retrieve from the cache because we are not about to use its data to interact with cluster-service. At
 	// the moment we only use the ClusterServiceID to interact with cluster-service, which shouldn't change over time once set.
 	// If at some point this controller evolves to use other Cluster properties that will be sent to cluster-service and that
@@ -134,6 +151,9 @@ func (c *nodePoolClusterServiceCreateSyncer) SyncOnce(ctx context.Context, key c
 		}
 		logger.Info("performing POST node pool to Cluster Service", "cs_node_pool_href", csNodePoolHREF, "node_pool_resource_id", nodePool.ID.String())
 		_, err = c.clustersServiceClient.PostNodePool(ctx, clusterCSInternalID, csNodePoolBuilder)
+		if c.isOCMErrorBadRequest(err) {
+			return c.setIntentFailed(ctx, key, err)
+		}
 		if err != nil {
 			return utils.TrackError(err)
 		}
@@ -149,6 +169,22 @@ func (c *nodePoolClusterServiceCreateSyncer) SyncOnce(ctx context.Context, key c
 	}
 	if err != nil {
 		return utils.TrackError(err)
+	}
+
+	controllerCRUD := c.resourcesDBClient.HCPClusters(key.SubscriptionID, key.ResourceGroupName).NodePools(key.HCPClusterName).Controllers(key.HCPNodePoolName)
+	if writeErr := controllerutils.WriteController(ctx, controllerCRUD, NodePoolClusterServiceCreateControllerName, key.InitialController,
+		func(ctrl *api.Controller) {
+			apimeta.SetStatusCondition(&ctrl.Status.Conditions, metav1.Condition{
+				Type:    api.ControllerConditionTypeIntentFailed,
+				Status:  metav1.ConditionFalse,
+				Reason:  api.ControllerConditionReasonAsExpected,
+				Message: "",
+			})
+		}); writeErr != nil {
+		if database.IsPreconditionFailedError(writeErr) {
+			return nil
+		}
+		return utils.TrackError(writeErr)
 	}
 
 	return nil
@@ -170,4 +206,43 @@ func (c *nodePoolClusterServiceCreateSyncer) findCSNodePool(ctx context.Context,
 
 func (c *nodePoolClusterServiceCreateSyncer) CooldownChecker() controllerutil.CooldownChecker {
 	return c.cooldownChecker
+}
+
+func (c *nodePoolClusterServiceCreateSyncer) setIntentFailed(ctx context.Context, key controllerutils.HCPNodePoolKey, err error) error {
+	logger := utils.LoggerFromContext(ctx)
+	logger.Error(err, "CS create rejected permanently because of client error, persisting IntentFailed condition")
+	controllerCRUD := c.resourcesDBClient.HCPClusters(key.SubscriptionID, key.ResourceGroupName).NodePools(key.HCPClusterName).Controllers(key.HCPNodePoolName)
+	if writeErr := controllerutils.WriteController(ctx, controllerCRUD, NodePoolClusterServiceCreateControllerName, key.InitialController,
+		func(ctrl *api.Controller) {
+			apimeta.SetStatusCondition(&ctrl.Status.Conditions, metav1.Condition{
+				Type:    api.ControllerConditionTypeIntentFailed,
+				Status:  metav1.ConditionTrue,
+				Reason:  api.CSNodePoolCreateClientErrorReason,
+				Message: utils.ErrorMessageWithoutLineTracking(err),
+			})
+		}); writeErr != nil {
+		if database.IsPreconditionFailedError(writeErr) {
+			return nil
+		}
+		return utils.TrackError(writeErr)
+	}
+	return nil
+}
+
+func (c *nodePoolClusterServiceCreateSyncer) isIntentFailed(ctx context.Context, key controllerutils.HCPNodePoolKey) (bool, error) {
+	controllerDoc, err := c.controllerLister.GetForNodePool(ctx, key.SubscriptionID, key.ResourceGroupName, key.HCPClusterName, key.HCPNodePoolName, NodePoolClusterServiceCreateControllerName)
+	if database.IsNotFoundError(err) {
+		// If the controller doesn't exist we consider the intent has not failed.
+		return false, nil
+	}
+	if err != nil {
+		return false, utils.TrackError(err)
+	}
+	cond := apimeta.FindStatusCondition(controllerDoc.Status.Conditions, api.ControllerConditionTypeIntentFailed)
+	return cond != nil && cond.Status == metav1.ConditionTrue && cond.Reason == api.CSNodePoolCreateClientErrorReason, nil
+}
+
+func (c *nodePoolClusterServiceCreateSyncer) isOCMErrorBadRequest(err error) bool {
+	var ocmErr *ocmerrors.Error
+	return err != nil && errors.As(err, &ocmErr) && ocmErr.Status() == http.StatusBadRequest
 }

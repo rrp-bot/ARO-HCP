@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/go-logr/logr/testr"
@@ -25,6 +26,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
 
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 
@@ -37,6 +39,7 @@ import (
 	"github.com/Azure/ARO-HCP/backend/pkg/listertesting"
 	"github.com/Azure/ARO-HCP/internal/api"
 	"github.com/Azure/ARO-HCP/internal/api/arm"
+	"github.com/Azure/ARO-HCP/internal/database"
 	"github.com/Azure/ARO-HCP/internal/databasetesting"
 	"github.com/Azure/ARO-HCP/internal/ocm"
 	"github.com/Azure/ARO-HCP/internal/utils"
@@ -85,15 +88,37 @@ func TestNodePoolClusterServiceCreateSyncer_SyncOnce(t *testing.T) {
 		assert.Equal(t, testNodePoolCSIDStr, stored.ServiceProviderProperties.ClusterServiceID.String())
 	}
 
+	verifyIntentFailed := func(t *testing.T, ctx context.Context, db *databasetesting.MockResourcesDBClient, want *metav1.Condition) {
+		t.Helper()
+		controllerDoc, err := db.HCPClusters(testSubscriptionID, testResourceGroupName).
+			NodePools(testClusterName).Controllers(testNodePoolName).Get(ctx, NodePoolClusterServiceCreateControllerName)
+		if want == nil {
+			assert.True(t, database.IsNotFoundError(err), "controller document should not exist")
+			return
+		}
+		require.NoError(t, err)
+		got := apimeta.FindStatusCondition(controllerDoc.Status.Conditions, api.ControllerConditionTypeIntentFailed)
+		require.NotNil(t, got, "expected IntentFailed condition to be set")
+		assert.Equal(t, want.Status, got.Status)
+		assert.Equal(t, want.Reason, got.Reason)
+		if want.Status == metav1.ConditionTrue {
+			require.NotEmpty(t, want.Message, "set want.Message to the exact persisted IntentFailed message")
+			assert.Equal(t, want.Message, got.Message)
+		} else {
+			assert.Empty(t, got.Message, "when want.Status is false, IntentFailed message must be empty")
+		}
+	}
+
 	testCases := []struct {
-		name              string
-		listerCluster     *api.HCPOpenShiftCluster
-		existingNodePool  *api.HCPOpenShiftClusterNodePool
-		listerNodePool    *api.HCPOpenShiftClusterNodePool // Optional. If not provided, existingNodePool is used as the listerNodePool
-		setupMockCSClient func(mock *ocm.MockClusterServiceClientSpec)
-		wantErr           bool
-		wantErrContain    string
-		verifyDB          func(t *testing.T, ctx context.Context, db *databasetesting.MockResourcesDBClient)
+		name               string
+		listerCluster      *api.HCPOpenShiftCluster
+		existingNodePool   *api.HCPOpenShiftClusterNodePool
+		listerNodePool     *api.HCPOpenShiftClusterNodePool // Optional. If not provided, existingNodePool is used as the listerNodePool
+		existingController *api.Controller
+		setupMockCSClient  func(mock *ocm.MockClusterServiceClientSpec)
+		wantErr            bool
+		wantErrContain     string
+		verifyDB           func(t *testing.T, ctx context.Context, db *databasetesting.MockResourcesDBClient)
 	}{
 		{
 			name:          "when ClusterServiceID is already set no-op is performed",
@@ -192,6 +217,92 @@ func TestNodePoolClusterServiceCreateSyncer_SyncOnce(t *testing.T) {
 			wantErr:        true,
 			wantErrContain: "post failed",
 		},
+		{
+			name:             "when PostNodePool returns 400 OCM error IntentFailed is set to True",
+			listerCluster:    newTestCluster(t, nil),
+			existingNodePool: newTestNodePoolForCreate(t, nil),
+			setupMockCSClient: func(mock *ocm.MockClusterServiceClientSpec) {
+				mock.EXPECT().
+					GetNodePool(gomock.Any(), nodePoolCSInternalID).
+					Return(nil, fakeOCMNotFoundError())
+				mock.EXPECT().
+					PostNodePool(gomock.Any(), clusterCSInternalID, gomock.Any()).
+					Return(nil, fakeOCMBadRequestError("Machine type not supported"))
+			},
+			verifyDB: func(t *testing.T, ctx context.Context, db *databasetesting.MockResourcesDBClient) {
+				verifyClusterServiceIDIsNil(t, ctx, db)
+				verifyIntentFailed(t, ctx, db, &metav1.Condition{
+					Status:  metav1.ConditionTrue,
+					Reason:  api.CSNodePoolCreateClientErrorReason,
+					Message: "status is 400: Machine type not supported",
+				})
+			},
+		},
+		{
+			name:             "when PostNodePool returns 500 OCM error it is propagated for retry",
+			listerCluster:    newTestCluster(t, nil),
+			existingNodePool: newTestNodePoolForCreate(t, nil),
+			setupMockCSClient: func(mock *ocm.MockClusterServiceClientSpec) {
+				mock.EXPECT().
+					GetNodePool(gomock.Any(), nodePoolCSInternalID).
+					Return(nil, fakeOCMNotFoundError())
+				mock.EXPECT().
+					PostNodePool(gomock.Any(), clusterCSInternalID, gomock.Any()).
+					Return(nil, fakeOCMInternalServerError("internal error"))
+			},
+			wantErr:        true,
+			wantErrContain: "internal error",
+			verifyDB: func(t *testing.T, ctx context.Context, db *databasetesting.MockResourcesDBClient) {
+				verifyClusterServiceIDIsNil(t, ctx, db)
+				verifyIntentFailed(t, ctx, db, nil)
+			},
+		},
+		{
+			name:             "when IntentFailed is already set no CS calls are made",
+			listerCluster:    newTestCluster(t, nil),
+			existingNodePool: newTestNodePoolForCreate(t, nil),
+			existingController: newTestControllerDocForCreate(t, []metav1.Condition{
+				{
+					Type:    api.ControllerConditionTypeIntentFailed,
+					Status:  metav1.ConditionTrue,
+					Reason:  api.CSNodePoolCreateClientErrorReason,
+					Message: "Machine type not supported",
+				},
+			}),
+			verifyDB: func(t *testing.T, ctx context.Context, db *databasetesting.MockResourcesDBClient) {
+				verifyClusterServiceIDIsNil(t, ctx, db)
+				verifyIntentFailed(t, ctx, db, &metav1.Condition{
+					Status:  metav1.ConditionTrue,
+					Reason:  api.CSNodePoolCreateClientErrorReason,
+					Message: "Machine type not supported",
+				})
+			},
+		},
+		{
+			name:             "successful PostNodePool clears IntentFailed to False",
+			listerCluster:    newTestCluster(t, nil),
+			existingNodePool: newTestNodePoolForCreate(t, nil),
+			setupMockCSClient: func(mock *ocm.MockClusterServiceClientSpec) {
+				mock.EXPECT().
+					GetNodePool(gomock.Any(), nodePoolCSInternalID).
+					Return(nil, fakeOCMNotFoundError())
+				csNodePool, err := arohcpv1alpha1.NewNodePool().
+					ID(testNodePoolName).
+					HREF(testNodePoolCSIDStr).
+					Build()
+				require.NoError(t, err)
+				mock.EXPECT().
+					PostNodePool(gomock.Any(), clusterCSInternalID, gomock.Any()).
+					Return(csNodePool, nil)
+			},
+			verifyDB: func(t *testing.T, ctx context.Context, db *databasetesting.MockResourcesDBClient) {
+				verifyClusterServiceIDIsSet(t, ctx, db)
+				verifyIntentFailed(t, ctx, db, &metav1.Condition{
+					Status: metav1.ConditionFalse,
+					Reason: api.ControllerConditionReasonAsExpected,
+				})
+			},
+		},
 	}
 
 	for _, tc := range testCases {
@@ -202,6 +313,9 @@ func TestNodePoolClusterServiceCreateSyncer_SyncOnce(t *testing.T) {
 			resources := []any{}
 			if tc.existingNodePool != nil {
 				resources = append(resources, tc.existingNodePool)
+			}
+			if tc.existingController != nil {
+				resources = append(resources, tc.existingController)
 			}
 			mockResourcesDBClient, err := databasetesting.NewMockResourcesDBClientWithResources(ctx, resources)
 			require.NoError(t, err)
@@ -229,6 +343,7 @@ func TestNodePoolClusterServiceCreateSyncer_SyncOnce(t *testing.T) {
 				cooldownChecker:       &alwaysSyncCooldownChecker{},
 				nodePoolLister:        &listertesting.SliceNodePoolLister{NodePools: nodePoolsForLister},
 				clusterLister:         &listertesting.SliceClusterLister{Clusters: clustersForLister},
+				controllerLister:      &listertesting.DBControllerLister{ResourcesDBClient: mockResourcesDBClient},
 				resourcesDBClient:     mockResourcesDBClient,
 				clustersServiceClient: mockCSClient,
 			}
@@ -255,6 +370,16 @@ func fakeOCMNotFoundError() error {
 	return e
 }
 
+func fakeOCMBadRequestError(msg string) error {
+	e, _ := ocmerrors.NewError().Status(http.StatusBadRequest).Reason(msg).Build()
+	return e
+}
+
+func fakeOCMInternalServerError(msg string) error {
+	e, _ := ocmerrors.NewError().Status(http.StatusInternalServerError).Reason(msg).Build()
+	return e
+}
+
 func newTestCluster(t *testing.T, opts func(*api.HCPOpenShiftCluster)) *api.HCPOpenShiftCluster {
 	t.Helper()
 	resourceID := api.Must(azcorearm.ParseResourceID(
@@ -271,7 +396,7 @@ func newTestCluster(t *testing.T, opts func(*api.HCPOpenShiftCluster)) *api.HCPO
 			},
 			Location: "eastus",
 		},
-		CosmosMetadata: arm.CosmosMetadata{ResourceID: resourceID},
+		CosmosMetadata: arm.CosmosMetadata{ResourceID: resourceID, PartitionKey: strings.ToLower(resourceID.SubscriptionID)},
 		ServiceProviderProperties: api.HCPOpenShiftClusterServiceProviderProperties{
 			ClusterServiceID: clusterInternalID,
 		},
@@ -280,6 +405,22 @@ func newTestCluster(t *testing.T, opts func(*api.HCPOpenShiftCluster)) *api.HCPO
 		opts(cluster)
 	}
 	return cluster
+}
+
+func newTestControllerDocForCreate(t *testing.T, conditions []metav1.Condition) *api.Controller {
+	t.Helper()
+	resourceID := api.Must(azcorearm.ParseResourceID(
+		"/subscriptions/" + testSubscriptionID +
+			"/resourceGroups/" + testResourceGroupName +
+			"/providers/Microsoft.RedHatOpenShift/hcpOpenShiftClusters/" + testClusterName +
+			"/nodePools/" + testNodePoolName +
+			"/hcpOpenShiftControllers/" + NodePoolClusterServiceCreateControllerName))
+	return &api.Controller{
+		CosmosMetadata: arm.CosmosMetadata{ResourceID: resourceID, PartitionKey: strings.ToLower(resourceID.SubscriptionID)},
+		Status: api.ControllerStatus{
+			Conditions: conditions,
+		},
+	}
 }
 
 func newTestNodePoolForCreate(t *testing.T, opts func(*api.HCPOpenShiftClusterNodePool)) *api.HCPOpenShiftClusterNodePool {
@@ -298,7 +439,7 @@ func newTestNodePoolForCreate(t *testing.T, opts func(*api.HCPOpenShiftClusterNo
 			},
 			Location: "eastus",
 		},
-		CosmosMetadata: arm.CosmosMetadata{ResourceID: resourceID},
+		CosmosMetadata: arm.CosmosMetadata{ResourceID: resourceID, PartitionKey: strings.ToLower(resourceID.SubscriptionID)},
 		Properties: api.HCPOpenShiftClusterNodePoolProperties{
 			Version: api.NodePoolVersionProfile{
 				ID:           "4.20.8",

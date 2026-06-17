@@ -16,16 +16,24 @@ package operationcontrollers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/cache"
 	utilsclock "k8s.io/utils/clock"
 
 	"github.com/Azure/ARO-HCP/backend/pkg/controllers/controllerutils"
+	"github.com/Azure/ARO-HCP/backend/pkg/controllers/nodepoolcreationcontrollers"
+	"github.com/Azure/ARO-HCP/backend/pkg/informers"
+	"github.com/Azure/ARO-HCP/backend/pkg/listers"
 	"github.com/Azure/ARO-HCP/internal/api"
+	"github.com/Azure/ARO-HCP/internal/api/arm"
 	"github.com/Azure/ARO-HCP/internal/database"
 	"github.com/Azure/ARO-HCP/internal/ocm"
 	"github.com/Azure/ARO-HCP/internal/utils"
@@ -34,6 +42,7 @@ import (
 type operationNodePoolCreate struct {
 	clock                utilsclock.PassiveClock
 	resourcesDBClient    database.ResourcesDBClient
+	controllerLister     listers.ControllerLister
 	clusterServiceClient ocm.ClusterServiceClientSpec
 	notificationClient   *http.Client
 }
@@ -58,10 +67,13 @@ func NewOperationNodePoolCreateController(
 	clusterServiceClient ocm.ClusterServiceClientSpec,
 	notificationClient *http.Client,
 	activeOperationInformer cache.SharedIndexInformer,
+	backendInformers informers.BackendInformers,
 ) controllerutils.Controller {
+	_, controllerLister := backendInformers.Controllers()
 	syncer := &operationNodePoolCreate{
 		clock:                clock,
 		resourcesDBClient:    resourcesDBClient,
+		controllerLister:     controllerLister,
 		clusterServiceClient: clusterServiceClient,
 		notificationClient:   notificationClient,
 	}
@@ -91,11 +103,6 @@ func (c *operationNodePoolCreate) ShouldProcess(ctx context.Context, operation *
 	return true
 }
 
-func (c *operationNodePoolCreate) shouldReconcileOperationAndResourceStatus(nodePool *api.HCPOpenShiftClusterNodePool) bool {
-	return nodePool.ServiceProviderProperties.DeletionTimestamp == nil &&
-		nodePool.ServiceProviderProperties.ClusterServiceID != nil
-}
-
 func (c *operationNodePoolCreate) SynchronizeOperation(ctx context.Context, key controllerutils.OperationKey) error {
 	logger := utils.LoggerFromContext(ctx)
 	logger.Info("checking operation")
@@ -120,22 +127,123 @@ func (c *operationNodePoolCreate) SynchronizeOperation(ctx context.Context, key 
 		return nil
 	}
 
-	csNodePoolStatus, err := c.clusterServiceClient.GetNodePoolStatus(ctx, *nodePool.ServiceProviderProperties.ClusterServiceID)
+	operationalState, err := c.determineOperationState(ctx, operation, nodePool)
 	if err != nil {
 		return utils.TrackError(err)
 	}
 
-	newOperationStatus, newOperationError, err := convertNodePoolStatus(operation, csNodePoolStatus)
-	if err != nil {
-		return utils.TrackError(err)
+	var persistErr *arm.CloudErrorBody
+	if operationalState.provisioningState == arm.ProvisioningStateFailed {
+		persistErr = &arm.CloudErrorBody{
+			Code:    arm.CloudErrorCodeInvalidRequestContent,
+			Message: operationalState.message,
+		}
 	}
-	logger.Info("new status", "newStatus", newOperationStatus)
 
 	logger.Info("updating status")
-	err = UpdateOperationStatus(ctx, c.clock, c.resourcesDBClient, operation, newOperationStatus, newOperationError, postAsyncNotificationFn(c.notificationClient))
+	err = UpdateOperationStatus(ctx, c.clock, c.resourcesDBClient, operation, operationalState.provisioningState, persistErr, postAsyncNotificationFn(c.notificationClient))
 	if err != nil {
 		return utils.TrackError(err)
 	}
 
 	return nil
+}
+
+func (c *operationNodePoolCreate) shouldReconcileOperationAndResourceStatus(nodePool *api.HCPOpenShiftClusterNodePool) bool {
+	return nodePool.ServiceProviderProperties.DeletionTimestamp == nil
+}
+
+func (c *operationNodePoolCreate) csNodePoolCreateDispatched(nodePool *api.HCPOpenShiftClusterNodePool) bool {
+	return nodePool.ServiceProviderProperties.ClusterServiceID != nil
+}
+
+func (c *operationNodePoolCreate) determineOperationState(ctx context.Context, operation *api.Operation, nodePool *api.HCPOpenShiftClusterNodePool) (*operationState, error) {
+	logger := utils.LoggerFromContext(ctx)
+
+	// If the CS NodePool create has not been dispatched yet we check if we have
+	// permanently failed because of a client error on CS node pool create. We
+	// also skip any other operation checks.
+	if !c.csNodePoolCreateDispatched(nodePool) {
+		state, err := c.csNodePoolCreateIntentFailedOperationState(ctx, operation)
+		if err != nil {
+			return nil, utils.TrackError(err)
+		}
+		logger.Info("CS NodePool Create not dispatched. Determined node pool create operation status", "operationState", state)
+
+		return state, nil
+	}
+
+	var errs []error
+	var operationStates []*operationState
+
+	if state, err := c.nodePoolServiceCreateOperationState(ctx, operation, nodePool); err != nil {
+		errs = append(errs, utils.TrackError(err))
+	} else {
+		operationStates = append(operationStates, state)
+	}
+
+	if err := errors.Join(errs...); err != nil {
+		return nil, err
+	}
+	if len(operationStates) == 0 {
+		return nil, errors.New("no operation states")
+	}
+	slices.SortStableFunc(operationStates, compareOperationState)
+	if operationStates[0] == nil {
+		return nil, errors.New("nil operation state")
+	}
+	logger.Info("determined node pool create operation status", "operationStates", operationStates)
+	picked, err := pickWorstOperationState(operationStates)
+	if err != nil {
+		return nil, utils.TrackError(err)
+	}
+	logger.Info("picked node pool create operation status", "provisioningState", picked.provisioningState, "message", picked.message)
+	return picked, nil
+}
+
+func (c *operationNodePoolCreate) csNodePoolCreateIntentFailedOperationState(ctx context.Context, operation *api.Operation) (*operationState, error) {
+	controllerDoc, err := c.controllerLister.GetForNodePool(ctx,
+		operation.ExternalID.SubscriptionID,
+		operation.ExternalID.ResourceGroupName,
+		operation.ExternalID.Parent.Name,
+		operation.ExternalID.Name,
+		nodepoolcreationcontrollers.NodePoolClusterServiceCreateControllerName,
+	)
+	if database.IsNotFoundError(err) {
+		// If the controller still doesn't exist we consider the state accepted so it retries again afterwards
+		return &operationState{provisioningState: arm.ProvisioningStateAccepted}, nil
+	}
+	if err != nil {
+		return nil, utils.TrackError(err)
+	}
+
+	intentFailedCondition := apimeta.FindStatusCondition(controllerDoc.Status.Conditions, api.ControllerConditionTypeIntentFailed)
+	if intentFailedCondition == nil {
+		return &operationState{provisioningState: arm.ProvisioningStateAccepted}, nil
+	}
+
+	if intentFailedCondition.Status == metav1.ConditionTrue && intentFailedCondition.Reason == api.CSNodePoolCreateClientErrorReason {
+		return newOperationState(arm.ProvisioningStateFailed, intentFailedCondition.Message), nil
+	}
+
+	return &operationState{provisioningState: arm.ProvisioningStateAccepted}, nil
+}
+
+func (c *operationNodePoolCreate) nodePoolServiceCreateOperationState(ctx context.Context, operation *api.Operation, nodePool *api.HCPOpenShiftClusterNodePool) (*operationState, error) {
+	logger := utils.LoggerFromContext(ctx)
+	csNodePoolStatus, err := c.clusterServiceClient.GetNodePoolStatus(ctx, *nodePool.ServiceProviderProperties.ClusterServiceID)
+	if err != nil {
+		return nil, utils.TrackError(err)
+	}
+
+	newOperationStatus, newOperationError, err := convertNodePoolStatus(operation, csNodePoolStatus)
+	if err != nil {
+		return nil, utils.TrackError(err)
+	}
+	logger.Info("new status via cluster-service", "newStatus", newOperationStatus, "newOperationError", newOperationError)
+	msg := ""
+	if newOperationError != nil {
+		msg = newOperationError.Message
+	}
+	return newOperationState(newOperationStatus, msg), nil
 }
