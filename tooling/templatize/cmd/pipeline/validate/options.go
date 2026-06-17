@@ -226,7 +226,7 @@ func (opts *ValidationOptions) ValidatePipelineConfigReferences(ctx context.Cont
 					return fmt.Errorf("%s failed to get resolver: %w", prefix, err)
 				}
 
-				cfg, err := resolver.GetRegionConfiguration(region)
+				cfg, err := resolver.GetRegionConfiguration(region, "1", replacements.RegionShortReplacement)
 				if err != nil {
 					return fmt.Errorf("%s failed to get region config: %w", prefix, err)
 				}

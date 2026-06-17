@@ -20,6 +20,8 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"k8s.io/apimachinery/pkg/util/sets"
+
 	configtypes "github.com/Azure/ARO-Tools/config/types"
 	"github.com/Azure/ARO-Tools/pipelines/topology"
 	"github.com/Azure/ARO-Tools/pipelines/types"
@@ -27,19 +29,22 @@ import (
 	rollout "github.com/Azure/ARO-HCP/tooling/templatize/cmd"
 )
 
-// RegionalResourceGroupNames extracts the regional resource group names from the configuration.
-// These are the RGs that correspond to region-scoped infrastructure (as opposed to global resources).
-func RegionalResourceGroupNames(cfg configtypes.Configuration) []string {
+// RegionalResourceGroupNames extracts the regional resource group names from the
+// base configuration and all per-stamp configurations. This ensures stamped RG
+// names (which vary per stamp) are included.
+func RegionalResourceGroupNames(stampConfigs map[string]configtypes.Configuration) []string {
 	rgPaths := []string{"regionRG", "svc.rg", "mgmt.rg"}
-	var names []string
-	for _, path := range rgPaths {
-		if rg, err := cfg.GetByPath(path); err == nil {
-			if rgStr, ok := rg.(string); ok {
-				names = append(names, rgStr)
+	names := sets.New[string]()
+	for _, cfg := range stampConfigs {
+		for _, path := range rgPaths {
+			if rg, err := cfg.GetByPath(path); err == nil {
+				if rgStr, ok := rg.(string); ok {
+					names.Insert(rgStr)
+				}
 			}
 		}
 	}
-	return names
+	return sets.List(names)
 }
 
 func DefaultOptions() *RawOptions {
@@ -55,6 +60,7 @@ func BindOptions(opts *RawOptions, cmd *cobra.Command) error {
 	cmd.Flags().StringArrayVar(&opts.TopologyFiles, "topology-config", opts.TopologyFiles, "Path to a topology configuration file. Can be specified multiple times.")
 	cmd.Flags().StringVar(&opts.Entrypoint, "entrypoint", opts.Entrypoint, "Name of the entrypoint to create Ev2 manifests for. Exclusive with --service-group.")
 	cmd.Flags().StringVar(&opts.ServiceGroup, "service-group", opts.ServiceGroup, "Name of the service group to create Ev2 manifests for. Exclusive with --entrypoint.")
+	cmd.Flags().StringVar(&opts.StampCountConfigRef, "stamp-count-config-ref", opts.StampCountConfigRef, "Configuration path where the stamp count is stored (e.g. mgmt.stamps.count). When provided, stamped service groups are executed once per stamp in parallel.")
 
 	for _, flag := range []string{"topology-config"} {
 		if err := cmd.MarkFlagFilename(flag); err != nil {
@@ -67,9 +73,10 @@ func BindOptions(opts *RawOptions, cmd *cobra.Command) error {
 type RawOptions struct {
 	*rollout.RawRolloutOptions
 
-	TopologyFiles []string
-	Entrypoint    string
-	ServiceGroup  string
+	TopologyFiles       []string
+	Entrypoint          string
+	ServiceGroup        string
+	StampCountConfigRef string
 }
 
 // validatedOptions is a private wrapper that enforces a call of Validate() before Complete() can be invoked.
@@ -89,6 +96,8 @@ type completedOptions struct {
 	Service    *topology.Service
 	Entrypoint *topology.Entrypoint
 	Pipelines  map[string]*types.Pipeline
+
+	StampCountConfigRef string
 
 	*rollout.RolloutOptions
 }
@@ -114,6 +123,10 @@ func (o *RawOptions) Validate(ctx context.Context) (*ValidatedOptions, error) {
 	validated, err := o.RawRolloutOptions.Validate(ctx)
 	if err != nil {
 		return nil, err
+	}
+
+	if validated.Stamp == "" && o.StampCountConfigRef == "" {
+		return nil, fmt.Errorf("either --stamp or --stamp-count-config-ref must be provided")
 	}
 
 	return &ValidatedOptions{
@@ -172,12 +185,12 @@ func (o *ValidatedOptions) Complete(ctx context.Context) (*Options, error) {
 
 	return &Options{
 		completedOptions: &completedOptions{
-			Topo:       t,
-			Entrypoint: e,
-			Service:    service,
-			Pipelines:  pipelines,
-
-			RolloutOptions: completed,
+			Topo:                t,
+			Entrypoint:          e,
+			Service:             service,
+			Pipelines:           pipelines,
+			StampCountConfigRef: o.StampCountConfigRef,
+			RolloutOptions:      completed,
 		},
 	}, nil
 }

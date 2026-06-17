@@ -537,7 +537,8 @@ local-run: $(TEMPLATIZE)
 	                                 --verbosity=$(LOG_LEVEL) \
 	                                 --timing-output=$(TIMING_OUTPUT) \
 	                                 --junit-output=$(ENTRYPOINT_JUNIT_OUTPUT) \
-	                                 --config-output=$(CONFIG_OUTPUT)
+	                                 --config-output=$(CONFIG_OUTPUT) \
+	                                 --stamp-count-config-ref=mgmt.stamps.count
 
 
 ifeq ($(wildcard $(YQ)),$(YQ))
@@ -591,6 +592,7 @@ cleanup: $(TEMPLATIZE)
 								     --dry-run=$(CLEANUP_DRY_RUN) \
 								     --only-regional \
 								     --wait=$(CLEANUP_WAIT) \
+								     --stamp-count-config-ref=mgmt.stamps.count \
 								     --verbosity=$(LOG_LEVEL)
 
 # Image Updater

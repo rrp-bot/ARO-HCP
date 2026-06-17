@@ -100,10 +100,12 @@ type ValidatedRolloutOptions struct {
 
 type completedRolloutOptions struct {
 	*ValidatedRolloutOptions
-	Options       *Options
-	Config        types.Configuration
-	Subscriptions map[string]string
-	StepCacheDir  string
+	Options        *Options
+	Config         types.Configuration
+	ConfigResolver config.ConfigResolver
+	RegionShort    string
+	Subscriptions  map[string]string
+	StepCacheDir   string
 
 	BicepClient *bicep.LSPClient
 }
@@ -200,9 +202,10 @@ func (o *ValidatedRolloutOptions) Complete(ctx context.Context) (*RolloutOptions
 		regionShort = o.RegionShortOverride
 	}
 
+	regionShortReplacement := regionShort + o.RegionShortSuffix
 	resolver, err := completed.ConfigProvider.GetResolver(&config.ConfigReplacements{
 		RegionReplacement:      o.Region,
-		RegionShortReplacement: regionShort + o.RegionShortSuffix,
+		RegionShortReplacement: regionShortReplacement,
 		StampReplacement:       o.Stamp,
 		CloudReplacement:       o.Cloud,
 		EnvironmentReplacement: o.DeployEnv,
@@ -211,7 +214,7 @@ func (o *ValidatedRolloutOptions) Complete(ctx context.Context) (*RolloutOptions
 	if err != nil {
 		return nil, fmt.Errorf("failed to get config resolver: %w", err)
 	}
-	variables, err := resolver.GetRegionConfiguration(o.Region)
+	variables, err := resolver.GetRegionConfiguration(o.Region, o.Stamp, regionShortReplacement)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get variables: %w", err)
 	}
@@ -239,6 +242,8 @@ func (o *ValidatedRolloutOptions) Complete(ctx context.Context) (*RolloutOptions
 			ValidatedRolloutOptions: o,
 			Options:                 completed,
 			Config:                  variables,
+			ConfigResolver:          resolver,
+			RegionShort:             regionShortReplacement,
 			Subscriptions:           o.Subscriptions,
 			StepCacheDir:            o.StepCacheDir,
 			BicepClient:             bicepClient,

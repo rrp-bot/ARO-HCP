@@ -259,7 +259,7 @@ func (opts *Options) RenderServiceConfig(ctx context.Context) error {
 		return fmt.Errorf("failed to get resolver: %w", err)
 	}
 
-	cfg, err := resolver.GetRegionConfiguration(opts.Region)
+	cfg, err := resolver.GetRegionConfiguration(opts.Region, opts.Stamp, replacements.RegionShortReplacement)
 	if err != nil {
 		cfg = map[string]any{}
 	}

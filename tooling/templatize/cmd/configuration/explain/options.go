@@ -179,7 +179,7 @@ func (opts *Options) ExplainConfiguration(ctx context.Context) error {
 		return fmt.Errorf("failed to get resolver: %w", err)
 	}
 
-	provenance, err := resolver.ValueProvenance(opts.Region, opts.Path)
+	provenance, err := resolver.ValueProvenance(opts.Region, opts.Stamp, opts.Path, replacements.RegionShortReplacement)
 	if err != nil {
 		return fmt.Errorf("failed to get value provenance: %w", err)
 	}
