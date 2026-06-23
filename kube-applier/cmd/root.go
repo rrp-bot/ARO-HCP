@@ -42,14 +42,24 @@ type KubeApplierRootCmdFlags struct {
 	Kubeconfig                  string
 	KubeNamespace               string
 	ManagementClusterResourceID string
-	AzureCosmosDBName           string
-	AzureCosmosDBURL            string
-	AzureCosmosContainerName    string
 	MetricsServerListenAddress  string
 	HealthzServerListenAddress  string
 	LeaderElectionID            string
 	LogVerbosity                int
 	ExitOnPanic                 bool
+
+	// Backend selects the storage implementation.
+	// Supported values: "cosmos" (default), "dynamodb".
+	Backend string
+
+	// Cosmos-specific flags — required when --backend=cosmos (the default).
+	AzureCosmosDBName        string
+	AzureCosmosDBURL         string
+	AzureCosmosContainerName string
+
+	// DynamoDB-specific flags — required when --backend=dynamodb.
+	DynamoTableName string
+	AWSRegion       string
 }
 
 func (f *KubeApplierRootCmdFlags) AddFlags(cmd *cobra.Command) {
@@ -58,10 +68,24 @@ func (f *KubeApplierRootCmdFlags) AddFlags(cmd *cobra.Command) {
 	cmd.Flags().StringVar(&f.KubeNamespace, "namespace", f.KubeNamespace,
 		"Kubernetes namespace that hosts the leader-election lease.")
 	cmd.Flags().StringVar(&f.ManagementClusterResourceID, "management-cluster", f.ManagementClusterResourceID,
-		"ResourceID of the management cluster this pod runs in. This is the Cosmos partition key.")
-	cmd.Flags().StringVar(&f.AzureCosmosDBName, "cosmos-name", f.AzureCosmosDBName, "Cosmos database name.")
-	cmd.Flags().StringVar(&f.AzureCosmosDBURL, "cosmos-url", f.AzureCosmosDBURL, "Cosmos database URL.")
-	cmd.Flags().StringVar(&f.AzureCosmosContainerName, "cosmos-container", f.AzureCosmosContainerName, "Cosmos container name.")
+		"ResourceID of the management cluster this pod runs in. Used as the storage shard/partition key.")
+	cmd.Flags().StringVar(&f.Backend, "backend", f.Backend,
+		`Storage backend to use. One of "cosmos" (default) or "dynamodb".`)
+
+	// Cosmos flags
+	cmd.Flags().StringVar(&f.AzureCosmosDBName, "cosmos-name", f.AzureCosmosDBName,
+		"Cosmos database name. Required when --backend=cosmos.")
+	cmd.Flags().StringVar(&f.AzureCosmosDBURL, "cosmos-url", f.AzureCosmosDBURL,
+		"Cosmos database URL. Required when --backend=cosmos.")
+	cmd.Flags().StringVar(&f.AzureCosmosContainerName, "cosmos-container", f.AzureCosmosContainerName,
+		"Cosmos container name. Required when --backend=cosmos.")
+
+	// DynamoDB flags
+	cmd.Flags().StringVar(&f.DynamoTableName, "dynamodb-table", f.DynamoTableName,
+		"DynamoDB table name. Required when --backend=dynamodb.")
+	cmd.Flags().StringVar(&f.AWSRegion, "aws-region", f.AWSRegion,
+		"AWS region for DynamoDB. Required when --backend=dynamodb.")
+
 	cmd.Flags().StringVar(&f.MetricsServerListenAddress, "metrics-listen-address", f.MetricsServerListenAddress,
 		"Address on which to expose Prometheus metrics.")
 	cmd.Flags().StringVar(&f.HealthzServerListenAddress, "healthz-listen-address", f.HealthzServerListenAddress,
@@ -73,29 +97,16 @@ func (f *KubeApplierRootCmdFlags) AddFlags(cmd *cobra.Command) {
 	cmd.Flags().BoolVar(&f.ExitOnPanic, "exit-on-panic", f.ExitOnPanic,
 		"If set, the process exits on any goroutine panic via apimachinery's HandleCrash.")
 
-	for _, name := range []string{"namespace", "management-cluster", "cosmos-name", "cosmos-url", "cosmos-container"} {
+	for _, name := range []string{"namespace", "management-cluster"} {
 		if err := cmd.MarkFlagRequired(name); err != nil {
-			// MarkFlagRequired only fails if the flag does not exist on the command,
-			// which is a programming error in this very function.
 			panic(fmt.Errorf("MarkFlagRequired(%q): %w", name, err))
 		}
 	}
 }
 
 func (f *KubeApplierRootCmdFlags) validate() error {
-	// MarkFlagRequired catches missing flags; these checks reject the
-	// pathological "--flag=" empty-string forms that cobra still accepts.
 	if len(f.ManagementClusterResourceID) == 0 {
 		return utils.TrackError(fmt.Errorf("--management-cluster must not be empty"))
-	}
-	if len(f.AzureCosmosDBName) == 0 {
-		return utils.TrackError(fmt.Errorf("--cosmos-name must not be empty"))
-	}
-	if len(f.AzureCosmosDBURL) == 0 {
-		return utils.TrackError(fmt.Errorf("--cosmos-url must not be empty"))
-	}
-	if len(f.AzureCosmosContainerName) == 0 {
-		return utils.TrackError(fmt.Errorf("--cosmos-container must not be empty"))
 	}
 	if len(f.KubeNamespace) == 0 {
 		return utils.TrackError(fmt.Errorf("--namespace must not be empty"))
@@ -106,12 +117,35 @@ func (f *KubeApplierRootCmdFlags) validate() error {
 	if f.LogVerbosity < 0 {
 		return utils.TrackError(fmt.Errorf("--log-verbosity must be >= 0"))
 	}
+
+	switch app.BackendType(f.Backend) {
+	case app.BackendTypeCosmos:
+		if len(f.AzureCosmosDBName) == 0 {
+			return utils.TrackError(fmt.Errorf("--cosmos-name must not be empty when --backend=cosmos"))
+		}
+		if len(f.AzureCosmosDBURL) == 0 {
+			return utils.TrackError(fmt.Errorf("--cosmos-url must not be empty when --backend=cosmos"))
+		}
+		if len(f.AzureCosmosContainerName) == 0 {
+			return utils.TrackError(fmt.Errorf("--cosmos-container must not be empty when --backend=cosmos"))
+		}
+	case app.BackendTypeDynamoDB:
+		if len(f.DynamoTableName) == 0 {
+			return utils.TrackError(fmt.Errorf("--dynamodb-table must not be empty when --backend=dynamodb"))
+		}
+		if len(f.AWSRegion) == 0 {
+			return utils.TrackError(fmt.Errorf("--aws-region must not be empty when --backend=dynamodb"))
+		}
+	default:
+		return utils.TrackError(fmt.Errorf("--backend must be %q or %q, got %q",
+			app.BackendTypeCosmos, app.BackendTypeDynamoDB, f.Backend))
+	}
+
 	return nil
 }
 
 // ToKubeApplierOptions resolves flags into the wired Options that the app
-// layer consumes. Each external dependency (kubeconfig, leader-election lock,
-// Cosmos client) is constructed here so that Run() never sees raw flag values.
+// layer consumes.
 func (f *KubeApplierRootCmdFlags) ToKubeApplierOptions(ctx context.Context, cmd *cobra.Command) (*app.Options, error) {
 	kubeconfig, err := app.NewKubeconfig(f.Kubeconfig)
 	if err != nil {
@@ -130,9 +164,18 @@ func (f *KubeApplierRootCmdFlags) ToKubeApplierOptions(ctx context.Context, cmd 
 	if err != nil {
 		return nil, utils.TrackError(fmt.Errorf("failed to parse management cluster resource ID: %w", err))
 	}
-	kubeApplierDBClient, err := app.NewKubeApplierDBClient(ctx, f.AzureCosmosDBURL, f.AzureCosmosDBName, f.AzureCosmosContainerName, managementClusterResourceID)
+
+	kubeApplierDBClient, err := app.NewKubeApplierDBClient(ctx, app.BackendConfig{
+		Backend:                     app.BackendType(f.Backend),
+		CosmosDBURL:                 f.AzureCosmosDBURL,
+		CosmosDBName:                f.AzureCosmosDBName,
+		CosmosContainerName:         f.AzureCosmosContainerName,
+		DynamoTableName:             f.DynamoTableName,
+		AWSRegion:                   f.AWSRegion,
+		ManagementClusterResourceID: managementClusterResourceID,
+	})
 	if err != nil {
-		return nil, utils.TrackError(fmt.Errorf("failed to create kube-applier Cosmos client: %w", err))
+		return nil, utils.TrackError(fmt.Errorf("failed to create kube-applier storage client: %w", err))
 	}
 
 	dyn, err := app.NewDynamicClient(kubeconfig)
@@ -153,6 +196,7 @@ func (f *KubeApplierRootCmdFlags) ToKubeApplierOptions(ctx context.Context, cmd 
 
 func NewKubeApplierRootCmdFlags() *KubeApplierRootCmdFlags {
 	return &KubeApplierRootCmdFlags{
+		Backend:                    string(app.BackendTypeCosmos),
 		MetricsServerListenAddress: ":8081",
 		HealthzServerListenAddress: ":8083",
 		LeaderElectionID:           "kube-applier",
@@ -173,16 +217,21 @@ func NewCmdRoot() *cobra.Command {
 		Long: fmt.Sprintf(`%s
 
 	The kube-applier reconciles ApplyDesire, DeleteDesire, and ReadDesire
-	documents stored in the kube-applier Cosmos container against the
-	management cluster's local kube-apiserver.
+	documents stored in a backend database against the management cluster's
+	local kube-apiserver. Supported backends: cosmos (default), dynamodb.
 
-	# Run kube-applier locally pointing at a personal-dev Cosmos and the
-	# in-cluster kubeconfig.
+	# Run against Cosmos (default)
 	%s --management-cluster ${MANAGEMENT_CLUSTER} \
 		--cosmos-container ${CONTAINER_NAME} \
 		--cosmos-name ${DB_NAME} --cosmos-url ${DB_URL} \
 		--namespace ${RP_NAMESPACE}
-`, app.AppShortDescriptionName, processName),
+
+	# Run against DynamoDB
+	%s --backend=dynamodb \
+		--management-cluster ${MANAGEMENT_CLUSTER} \
+		--dynamodb-table ${TABLE_NAME} --aws-region ${REGION} \
+		--namespace ${RP_NAMESPACE}
+`, app.AppShortDescriptionName, processName, processName),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			err := RunRootCmd(cmd, flags)
 			if err != nil {
