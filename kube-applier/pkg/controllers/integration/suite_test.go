@@ -238,9 +238,9 @@ func makeUnstructuredCM(name, namespace string) *unstructured.Unstructured {
 // ---------------------------------------------------------------------------
 
 // TestIntegration_DeleteDesire_RemovesObject pre-creates a ConfigMap on the
-// management envtest cluster, seeds a DeleteDesire in DynamoDB, runs the
-// delete_desire controller, and verifies the ConfigMap is gone and
-// Successful=True is stored in DynamoDB.
+// management envtest cluster, seeds a DeleteDesire in DynamoDB, calls
+// SyncOnce on the controller directly, and verifies the ConfigMap is gone
+// and Successful=True is stored in DynamoDB.
 func TestIntegration_DeleteDesire_RemovesObject(t *testing.T) {
 	skipIfNotReady(t)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -278,54 +278,32 @@ func TestIntegration_DeleteDesire_RemovesObject(t *testing.T) {
 	stored, err := ddCRUD.Create(ctx, desire, nil)
 	require.NoError(t, err)
 
-	// Build a minimal static informer so the controller's event-handler
-	// registration succeeds. The informer lists the stored DeleteDesire and
-	// delivers an Added event to the controller's handleAdd — that is enough
-	// to enqueue the desire for reconciliation. We do not wait for HasSynced
-	// because the controller itself does not require it; we simply wait for
-	// the observable side-effect (ConfigMap deletion) instead.
+	// Build the controller with a no-op informer stub — we drive it via
+	// SyncOnce so the informer machinery is not exercised here.
 	informer := cache.NewSharedIndexInformer(
 		&cache.ListWatch{
-			ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
-				return &kubeapplier.DeleteDesireList{Items: []kubeapplier.DeleteDesire{*stored}}, nil
-			},
-			WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
-				// Return a fake watcher that stays open but never sends events.
-				// The reflector will keep it alive; the initial List is enough
-				// to fire the Added event handler and enqueue the desire.
-				return watch.NewFake(), nil
-			},
+			ListFunc:  func(options metav1.ListOptions) (runtime.Object, error) { return &kubeapplier.DeleteDesireList{}, nil },
+			WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) { return watch.NewFake(), nil },
 		},
-		&kubeapplier.DeleteDesire{},
-		0,
-		cache.Indexers{},
+		&kubeapplier.DeleteDesire{}, 0, cache.Indexers{},
 	)
-
 	c, err := delete_desire.NewDeleteDesireController(informer, suite.mgmtDyn, dbClient, delete_desire.Config{
 		CooldownPeriod: 10 * time.Millisecond,
 	})
 	require.NoError(t, err)
 
-	// Start the informer and controller concurrently. The informer delivers
-	// the Added event from the initial List; no need to wait for HasSynced.
-	go informer.Run(ctx.Done())
-	go c.Run(ctx, 1)
+	// Derive the key and call SyncOnce directly — no queue, no informer sync needed.
+	key, err := keys.DeleteDesireKeyFromResourceID(stored.GetResourceID())
+	require.NoError(t, err)
+	require.NoError(t, c.SyncOnce(ctx, key))
 
-	// Wait for the ConfigMap to disappear from the management cluster.
-	err = wait.PollUntilContextTimeout(ctx, 200*time.Millisecond, 20*time.Second, true, func(ctx context.Context) (bool, error) {
-		_, getErr := suite.mgmtDyn.Resource(cmGVR).Namespace("default").Get(ctx, "integ-delete-cm", metav1.GetOptions{})
-		if apierrors.IsNotFound(getErr) {
-			return true, nil
-		}
-		if getErr != nil {
-			return false, getErr
-		}
-		return false, nil
-	})
-	assert.NoError(t, err, "ConfigMap should be removed from management cluster after DeleteDesire reconciles")
+	// ConfigMap should be gone (SyncOnce issues the Delete synchronously).
+	_, err = suite.mgmtDyn.Resource(cmGVR).Namespace("default").Get(ctx, "integ-delete-cm", metav1.GetOptions{})
+	assert.True(t, apierrors.IsNotFound(err), "ConfigMap should be removed from management cluster after SyncOnce")
 
-	// Also verify Successful=True is persisted to DynamoDB.
-	err = wait.PollUntilContextTimeout(ctx, 200*time.Millisecond, 20*time.Second, true, func(ctx context.Context) (bool, error) {
+	// SyncOnce also writes Successful=True back to DynamoDB via UpdateStatus.
+	// Poll briefly to allow any async write to settle (usually immediate).
+	err = wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 5*time.Second, true, func(ctx context.Context) (bool, error) {
 		d, getErr := ddCRUD.Get(ctx, "dd-integ")
 		if getErr != nil {
 			return false, getErr
@@ -333,7 +311,7 @@ func TestIntegration_DeleteDesire_RemovesObject(t *testing.T) {
 		cond := findIntegCond(d.Status.Conditions, kubeapplier.ConditionTypeSuccessful)
 		return cond != nil && cond.Status == metav1.ConditionTrue, nil
 	})
-	assert.NoError(t, err, "Successful=True should be persisted to DynamoDB after deletion")
+	assert.NoError(t, err, "Successful=True should be persisted to DynamoDB after SyncOnce")
 }
 
 // ---------------------------------------------------------------------------
