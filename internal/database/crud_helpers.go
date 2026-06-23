@@ -197,7 +197,7 @@ func PrepareForReplace[InternalAPIType any, InternalAPITypePointer arm.CosmosMet
 // SerializeItem refuses to write a document with an empty partition key
 // because doing so silently corrupts the container.
 func SerializeItem[InternalAPIType, CosmosAPIType any, InternalAPITypePointer arm.CosmosMetadataAccessorPtr[InternalAPIType]](newObj InternalAPITypePointer) (*arm.CosmosMetadata, []byte, error) {
-	cosmosData := newObj.GetCosmosData()
+	cosmosData := newObj.GetDocumentMetadata()
 	if len(newObj.GetPartitionKey()) == 0 {
 		return nil, nil, fmt.Errorf("type %T has no PartitionKey on its CosmosMetadata; the CRUD layer must call SetPartitionKey before serializing", newObj)
 	}
