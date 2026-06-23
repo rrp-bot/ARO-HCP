@@ -279,18 +279,21 @@ func TestIntegration_DeleteDesire_RemovesObject(t *testing.T) {
 	require.NoError(t, err)
 
 	// Build a minimal static informer so the controller's event-handler
-	// registration succeeds without needing a live apiserver informer.
-	// We use a RaceFreeFake watcher and send a Bookmark event after the
-	// informer starts — that is what causes the reflector to mark the
-	// cache as synced (HasSynced=true).
-	fakeWatcher := watch.NewRaceFreeFake()
+	// registration succeeds. The informer lists the stored DeleteDesire and
+	// delivers an Added event to the controller's handleAdd — that is enough
+	// to enqueue the desire for reconciliation. We do not wait for HasSynced
+	// because the controller itself does not require it; we simply wait for
+	// the observable side-effect (ConfigMap deletion) instead.
 	informer := cache.NewSharedIndexInformer(
 		&cache.ListWatch{
 			ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
 				return &kubeapplier.DeleteDesireList{Items: []kubeapplier.DeleteDesire{*stored}}, nil
 			},
 			WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
-				return fakeWatcher, nil
+				// Return a fake watcher that stays open but never sends events.
+				// The reflector will keep it alive; the initial List is enough
+				// to fire the Added event handler and enqueue the desire.
+				return watch.NewFake(), nil
 			},
 		},
 		&kubeapplier.DeleteDesire{},
@@ -303,18 +306,9 @@ func TestIntegration_DeleteDesire_RemovesObject(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	// Start the informer, send a Bookmark to unblock HasSynced, then wait.
+	// Start the informer and controller concurrently. The informer delivers
+	// the Added event from the initial List; no need to wait for HasSynced.
 	go informer.Run(ctx.Done())
-	// Give the reflector time to issue the Watch call before we send on it.
-	time.Sleep(100 * time.Millisecond)
-	fakeWatcher.Action(watch.Bookmark, &kubeapplier.DeleteDesire{})
-	syncCtx, syncCancel := context.WithTimeout(ctx, 5*time.Second)
-	defer syncCancel()
-	if !cache.WaitForCacheSync(syncCtx.Done(), informer.HasSynced) {
-		t.Fatal("informer did not sync within 5s")
-	}
-
-	// Run the controller.
 	go c.Run(ctx, 1)
 
 	// Wait for the ConfigMap to disappear from the management cluster.
