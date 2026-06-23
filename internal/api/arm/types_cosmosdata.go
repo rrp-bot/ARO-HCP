@@ -148,65 +148,6 @@ func (o *DocumentMetadata) GetCosmosData() *DocumentMetadata {
 	return o.GetDocumentMetadata()
 }
 
-// GetShardKey returns the lowercased shard/partition key stored on the
-// metadata. The storage backend is responsible for populating this field
-// on the write path and on the read path; callers may rely on it being set
-// after a successful Create/Get round-trip. The value is lowercased on the
-// way out so callers do not have to do it themselves.
-func (o *DocumentMetadata) GetShardKey() string {
-	return strings.ToLower(o.ShardKey)
-}
-
-// SetPartitionKey stores the shard key. Kept for backward compatibility.
-func (o *DocumentMetadata) SetPartitionKey(partitionKey string) {
-	o.SetShardKey(partitionKey)
-}
-
-// SetShardKey stores the shard/partition key on the metadata, lowercasing the
-// supplied value.
-func (o *DocumentMetadata) SetShardKey(shardKey string) {
-	o.ShardKey = strings.ToLower(shardKey)
-}
-
-func (o *DocumentMetadata) GetResourceID() *azcorearm.ResourceID {
-	return o.ResourceID
-}
-
-func (o *DocumentMetadata) SetResourceID(resourceID *azcorearm.ResourceID) {
-	o.ResourceID = resourceID
-}
-
-func (o *DocumentMetadata) GetEtag() azcore.ETag {
-	return o.Etag
-}
-
-func (o *DocumentMetadata) SetEtag(etag azcore.ETag) {
-	o.Etag = etag
-}
-
-// GetInstanceVersion returns the monotonically-increasing version counter
-// stored on the document. The storage layer auto-increments it via SetInstanceVersion
-// on every Replace (see PrepareForReplace).
-func (o *DocumentMetadata) GetInstanceVersion() int64 {
-	return o.InstanceVersion
-}
-
-// SetInstanceVersion overwrites the version counter. The storage layer is the
-// only legitimate caller; tests can read it via GetInstanceVersion to assert
-// the increment happened.
-func (o *DocumentMetadata) SetInstanceVersion(v int64) {
-	o.InstanceVersion = v
-}
-
-func (o *DocumentMetadata) GetDocumentMetadata() *DocumentMetadata {
-	return o
-}
-
-// GetCosmosData is a backward-compatible alias for GetDocumentMetadata.
-func (o *DocumentMetadata) GetCosmosData() *DocumentMetadata {
-	return o.GetDocumentMetadata()
-}
-
 // DocumentMetadataAccessor is the full interface that all persistable types must implement.
 type DocumentMetadataAccessor interface {
 	DocumentPersistable
