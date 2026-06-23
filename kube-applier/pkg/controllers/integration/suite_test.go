@@ -280,13 +280,17 @@ func TestIntegration_DeleteDesire_RemovesObject(t *testing.T) {
 
 	// Build a minimal static informer so the controller's event-handler
 	// registration succeeds without needing a live apiserver informer.
+	// We use a RaceFreeFake watcher and send a Bookmark event after the
+	// informer starts — that is what causes the reflector to mark the
+	// cache as synced (HasSynced=true).
+	fakeWatcher := watch.NewRaceFreeFake()
 	informer := cache.NewSharedIndexInformer(
 		&cache.ListWatch{
 			ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
 				return &kubeapplier.DeleteDesireList{Items: []kubeapplier.DeleteDesire{*stored}}, nil
 			},
 			WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
-				return watch.NewFake(), nil
+				return fakeWatcher, nil
 			},
 		},
 		&kubeapplier.DeleteDesire{},
@@ -299,8 +303,11 @@ func TestIntegration_DeleteDesire_RemovesObject(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	// Start the informer and wait for initial sync.
+	// Start the informer, send a Bookmark to unblock HasSynced, then wait.
 	go informer.Run(ctx.Done())
+	// Give the reflector time to issue the Watch call before we send on it.
+	time.Sleep(100 * time.Millisecond)
+	fakeWatcher.Action(watch.Bookmark, &kubeapplier.DeleteDesire{})
 	syncCtx, syncCancel := context.WithTimeout(ctx, 5*time.Second)
 	defer syncCancel()
 	if !cache.WaitForCacheSync(syncCtx.Done(), informer.HasSynced) {
