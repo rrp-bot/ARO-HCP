@@ -271,8 +271,8 @@ func (m *mockResourceCRUD[InternalAPIType, InternalAPITypePointer, CosmosAPIType
 	if err != nil {
 		return nil, utils.TrackError(err)
 	}
-	storedETag := any(oldObj).(arm.CosmosPersistable).GetCosmosData().CosmosETag
-	existingCosmosID := any(oldObj).(arm.CosmosPersistable).GetCosmosData().GetCosmosUID()
+	storedETag := any(oldObj).(arm.DocumentMetadataAccessor).GetDocumentMetadata().CosmosETag
+	existingCosmosID := any(oldObj).(arm.DocumentMetadataAccessor).GetDocumentMetadata().GetCosmosUID()
 
 	if storedETag != expectedETag {
 		return nil, NewPreconditionFailedError()
